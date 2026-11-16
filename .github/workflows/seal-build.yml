@@ -1,0 +1,127 @@
+# Build and test Apache Ant on the ali-security fork.
+# Upstream Ant has no GitHub Actions CI; this workflow follows the project's
+# own ReleaseInstructions: bootstrap, `./build.sh` (jars), `./build.sh test`.
+# The 1.10.9 release jar was built with JDK 14 (Created-By: 14.0.1) targeting
+# Java 8; JDK 9+ is required so the taskdefs/modules (jlink/jmod) classes are
+# compiled into ant.jar.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Single test to run (JUnit class name or AntUnit file path relative to src/tests/antunit); empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 14
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "14"
+
+      - name: Show toolchain
+        run: |
+          java -version
+          javac -version
+
+      - name: Fetch Xalan for the XSLT liaison tests
+        # Same optional library (xalan.version=2.7.2 in lib/libraries.properties)
+        # that `ant -f fetch.xml -Ddest=optional` provides. It must be present
+        # before bootstrap: AntUnit tests run inside the bootstrap Ant, which
+        # needs Xalan2TraceSupport (xslt-test.xml testTrace). The ant.core
+        # selector excludes needs.apache-xalan2, so ant.jar is unaffected.
+        run: |
+          curl -fsSL -o lib/optional/xalan-2.7.2.jar https://repo1.maven.org/maven2/xalan/xalan/2.7.2/xalan-2.7.2.jar
+          curl -fsSL -o lib/optional/serializer-2.7.2.jar https://repo1.maven.org/maven2/xalan/serializer/2.7.2/serializer-2.7.2.jar
+
+      - name: Bootstrap and build jars
+        run: |
+          ./bootstrap.sh
+          ./build.sh jars
+          mkdir -p seal-out
+          cp build/lib/ant.jar seal-out/ant-1.10.9.jar
+          unzip -l seal-out/ant-1.10.9.jar | tail -1
+
+      - name: Run test suite
+        shell: bash
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            ./build.sh test -Dtestcase="$TEST_FILTER"
+          else
+            ./build.sh test
+          fi
+
+      - name: Test results summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import glob, xml.etree.ElementTree as ET
+          # Reasons for skips whose own message is empty or only an assumption
+          # matcher, taken from the test sources.
+          why = {
+              "SQLExecTest.testMySQL": "@Ignore'd upstream: needs a live MySQL server and JDBC driver",
+              "SQLExecTest.testOracle": "@Ignore'd upstream: needs a live Oracle server and JDBC driver",
+              "TokenFilterTest.testScriptFilter": "upstream tokenfilter.xml defines no 'testScriptFilter' target, so the assumeThat never holds (dead test upstream)",
+              "TokenFilterTest.testScriptFilter2": "upstream tokenfilter.xml defines no 'testScriptFilter' target, so the assumeThat never holds (dead test upstream)",
+              "JavaEnvUtilsTest.java10IsDetectedProperly": "assumes the running JVM is Java 10; this leg runs JDK 14",
+              "JavaEnvUtilsTest.java11IsDetectedProperly": "assumes the running JVM is Java 11; this leg runs JDK 14",
+              "JavaEnvUtilsTest.java12IsDetectedProperly": "assumes the running JVM is Java 12; this leg runs JDK 14",
+              "JavaEnvUtilsTest.isJavaVersionSupportsBothVersionsOfJava9": "assumes the running JVM is Java 9; this leg runs JDK 14",
+              "JavahTest.testSimpleCompile": "assumeFalse(Java 10+): the javah tool was removed in JDK 10; this leg runs JDK 14",
+              "JavahTest.testCompileFileset": "assumeFalse(Java 10+): the javah tool was removed in JDK 10; this leg runs JDK 14",
+          }
+          def reason(name, msg):
+              short = ".".join(name.split(".")[-2:])
+              return f"{msg} -- {why[short]}" if short in why else msg
+          kinds = {"JUnit": glob.glob("build/testcases/xml/TEST-*.xml"),
+                   "AntUnit": glob.glob("build/antunit/xml/TEST-*.xml")}
+          for kind, files in kinds.items():
+              run = 0
+              skipped = []
+              failed = []
+              for f in files:
+                  try:
+                      root = ET.parse(f).getroot()
+                  except ET.ParseError as e:
+                      print(f"unparseable result file {f}: {e}")
+                      continue
+                  suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+                  for s in suites:
+                      for tc in s.findall("testcase"):
+                          run += 1
+                          name = f"{tc.get('classname') or s.get('name')}.{tc.get('name')}"
+                          sk = tc.find("skipped")
+                          if sk is not None:
+                              skipped.append((name, sk.get("message") or (sk.text or "").strip() or "no message given"))
+                          for tag in ("failure", "error"):
+                              el = tc.find(tag)
+                              if el is not None:
+                                  failed.append((name, tag, el.get("message")))
+              passed = run - len(failed) - len(skipped)
+              print(f"{kind} TOTAL: result files={len(files)} tests={run} passed={passed} failed={len(failed)} skipped={len(skipped)}")
+              for n, t, m in failed:
+                  print(f"  {kind} FAILED [{t}] {n}: {m}")
+              for n, m in skipped:
+                  print(f"  {kind} SKIPPED {n}: {reason(n, m)}")
+          print("Disabled in source (network-dependent, see XML comments in the test files):")
+          print("  AntUnit taskdefs/hostinfo-test.xml testForward, testReverse: assert live DNS records of www.xs4all.nl that changed since release")
+          print("  AntUnit types/resources/test.xml testhttpurl1: http://www.w3.org/MarkUp/ returns an empty body to CI runners")
+          EOF
+
+      - name: Upload ant jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: ant-jar
+          path: seal-out/ant-1.10.9.jar
+          if-no-files-found: error
